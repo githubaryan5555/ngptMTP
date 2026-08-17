@@ -189,23 +189,26 @@ class GPT(nn.Module):
             multitok = max(1, int(getattr(self.config, 'multitok_pred', 1)))
             loss = None
             vocab_size = logits.size(-1)
+            loss_k = []
             for k in range(1, multitok + 1):
                 if t - k <= 0:
                     break
                 pred = logits[:, :-k, :].reshape(-1, vocab_size)
                 targ = targets[:, k:].reshape(-1)
                 # ignore_index stays -1 so any padding can be masked
-                loss_k = F.cross_entropy(pred, targ, ignore_index=-1)
+                loss_k_val = F.cross_entropy(pred, targ, ignore_index=-1)
+                loss_k.append(loss_k_val)
                 if loss is None:
-                    loss = loss_k
+                    loss = loss_k_val
                 else:
-                    loss = loss + loss_k
+                    loss = loss + loss_k_val
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+            loss_k = None
 
-        return logits, loss
+        return logits, loss, loss_k
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
