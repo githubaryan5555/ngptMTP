@@ -114,6 +114,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    multitok_pred: int = 1 # number of future tokens to predict (1 = standard next-token)
 
 class GPT(nn.Module):
 
@@ -183,8 +184,22 @@ class GPT(nn.Module):
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = self.lm_head(x)  # (b, t, vocab_size)
+            # sum cross-entropy losses for predicting multiple future tokens (1..multitok_pred)
+            multitok = max(1, int(getattr(self.config, 'multitok_pred', 1)))
+            loss = None
+            vocab_size = logits.size(-1)
+            for k in range(1, multitok + 1):
+                if t - k <= 0:
+                    break
+                pred = logits[:, :-k, :].reshape(-1, vocab_size)
+                targ = targets[:, k:].reshape(-1)
+                # ignore_index stays -1 so any padding can be masked
+                loss_k = F.cross_entropy(pred, targ, ignore_index=-1)
+                if loss is None:
+                    loss = loss_k
+                else:
+                    loss = loss + loss_k
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
