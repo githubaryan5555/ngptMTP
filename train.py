@@ -22,6 +22,11 @@ import math
 import pickle
 from contextlib import nullcontext
 
+import json
+import sys
+import logging
+import atexit
+
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -74,6 +79,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+# logging options
+log_json = True  # write structured JSONL logs to out_dir/train_logs.jsonl
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -112,6 +119,24 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# logging setup (console + optional JSONL file)
+logger = logging.getLogger('train')
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler(stream=sys.stdout)
+ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+logger.addHandler(ch)
+json_fh = None
+if log_json and master_process:
+    log_file = os.path.join(out_dir, 'train_logs.jsonl')
+    json_fh = open(log_file, 'a', buffering=1)
+    def _close_logs():
+        try:
+            if json_fh is not None and not json_fh.closed:
+                json_fh.close()
+        except Exception:
+            pass
+    atexit.register(_close_logs)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -223,16 +248,36 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        total_avg_losses = 0.0
+        total_loss_k = None
+        for _ in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
-                # if the model sums multitoken losses, average them here for reporting
-                if multitok_pred > 1 and loss is not None:
-                    loss = loss / float(multitok_pred)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+                ret = model(X, Y)
+            # support both returns: (logits, loss) OR (logits, loss, loss_k)
+            if isinstance(ret, tuple) and len(ret) == 3:
+                _, loss, loss_k = ret
+            else:
+                _, loss = ret
+                loss_k = None
+            if loss is None:
+                continue
+            if loss_k is not None:
+                loss_vals = [lk.item() for lk in loss_k]
+                avg_loss = float(sum(loss_vals) / len(loss_vals))
+                if total_loss_k is None:
+                    total_loss_k = [0.0] * len(loss_vals)
+                for i, v in enumerate(loss_vals):
+                    total_loss_k[i] += v
+            else:
+                avg_loss = loss.item()
+            total_avg_losses += avg_loss
+        avg = total_avg_losses / eval_iters
+        if total_loss_k is not None:
+            avg_k = [v / eval_iters for v in total_loss_k]
+        else:
+            avg_k = None
+        out[split] = {'avg': avg, 'loss_k': avg_k}
     model.train()
     return out
 
@@ -271,17 +316,17 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']['avg']:.4f}, val loss {losses['val']['avg']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/loss": losses['train']['avg'],
+                "val/loss": losses['val']['avg'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if losses['val']['avg'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']['avg']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -306,11 +351,25 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
-            # if model returned a sum over multiple future-token losses, normalize to per-prediction
-            if multitok_pred > 1 and loss is not None:
-                loss = loss / float(multitok_pred)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            ret = model(X, Y)
+        # unpack returns: backward-compatible with (logits, loss) or (logits, loss, loss_k)
+        if isinstance(ret, tuple) and len(ret) == 3:
+            logits, loss_sum_or_none, loss_k = ret
+        else:
+            logits, loss_sum_or_none = ret
+            loss_k = None
+
+        if loss_sum_or_none is None:
+            raise RuntimeError("Model returned no loss during training; make sure targets are provided.")
+
+        # If model returned a list of per-k losses, average them for per-prediction loss
+        if loss_k is not None:
+            avg_loss = sum(loss_k) / float(len(loss_k))
+        else:
+            avg_loss = loss_sum_or_none
+
+        # scale the loss to account for gradient accumulation
+        loss = avg_loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -331,12 +390,61 @@ while True:
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
+        try:
+            last_avg_loss = avg_loss.item()
+        except Exception:
+            last_avg_loss = float(loss_sum_or_none.item() if hasattr(loss_sum_or_none, 'item') else 0.0)
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+        # compute tokens/sec throughput estimation
+        tokens_this_iter = batch_size * gradient_accumulation_steps * block_size
+        tokens_per_sec = tokens_this_iter / dt if dt > 0 else 0.0
+
+        # gather per-k values for train (if available)
+        train_loss_k_vals = None
+        if loss_k is not None:
+            train_loss_k_vals = [lk.item() for lk in loss_k]
+
+        metrics = {
+            'iter': iter_num,
+            'local_iter': local_iter_num,
+            'lr': lr,
+            'time_ms': dt * 1000.0,
+            'mfu': (running_mfu * 100.0) if running_mfu != -1.0 else None,
+            'tokens_per_sec': tokens_per_sec,
+            'batch_size': batch_size,
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+            'multitok_pred': getattr(raw_model.config, 'multitok_pred', multitok_pred),
+            'train/loss': last_avg_loss,
+            'train/loss_k': train_loss_k_vals,
+        }
+
+        # optionally run eval and add to metrics
+        if iter_num % eval_interval == 0:
+            losses = estimate_loss()
+            metrics['val/loss'] = losses['val']['avg']
+            metrics['val/loss_k'] = losses['val']['loss_k']
+            metrics['train/loss_eval'] = losses['train']['avg']
+            metrics['train/loss_k_eval'] = losses['train']['loss_k']
+
+        # console and jsonl logging
+        logger.info(json.dumps(metrics, default=str))
+        if json_fh is not None:
+            try:
+                json_fh.write(json.dumps(metrics, default=str) + '\n')
+            except Exception as e:
+                logger.warning(f"failed to write json log: {e}")
+
+        # wandb log if enabled
+        if wandb_log:
+            try:
+                wb_metrics = {k: v for k, v in metrics.items() if v is not None}
+                wandb.log(wb_metrics)
+            except Exception as e:
+                logger.warning(f"wandb logging failed: {e}")
+
     iter_num += 1
     local_iter_num += 1
 
